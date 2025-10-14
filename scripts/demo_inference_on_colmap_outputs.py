@@ -34,7 +34,7 @@ from mapanything.models import MapAnything
 from mapanything.utils.colmap import get_camera_matrix, qvec2rotmat, read_model
 from mapanything.utils.geometry import closed_form_pose_inverse, depthmap_to_world_frame
 from mapanything.utils.image import preprocess_inputs
-from mapanything.utils.viz import predictions_to_glb, script_add_rerun_args
+from mapanything.utils.viz import predictions_to_glb, predictions_to_ply, script_add_rerun_args
 
 
 def load_colmap_data(colmap_path, stride=1, verbose=False, ext=".bin"):
@@ -322,6 +322,12 @@ def get_parser():
         help="Save reconstruction as GLB file",
     )
     parser.add_argument(
+        "--save_ply",
+        action="store_true",
+        default=False,
+        help="Save reconstruction as PLY file",
+    )
+    parser.add_argument(
         "--output_directory",
         type=str,
         default="colmap_mapanything_output",
@@ -435,7 +441,7 @@ def main():
         image_np = pred["img_no_norm"][0].cpu().numpy()
 
         # Store data for GLB export if needed
-        if args.save_glb:
+        if args.save_glb or args.save_ply:
             world_points_list.append(pts3d_np)
             images_list.append(image_np)
             masks_list.append(mask)
@@ -457,6 +463,26 @@ def main():
     # Convey that the visualization is complete
     if args.viz:
         print("Visualization complete! Check the Rerun viewer.")
+
+    # Prepare data for export (if GLB or PLY export is requested)
+    if args.save_glb or args.save_ply:
+        # Stack all views
+        world_points = np.stack(world_points_list, axis=0)
+        images = np.stack(images_list, axis=0)
+        final_masks = np.stack(masks_list, axis=0)
+
+        # Create predictions dict for export
+        predictions = {
+            "world_points": world_points,
+            "images": images,
+            "final_masks": final_masks,
+        }
+
+        # Convert to 3D scene
+        if args.save_glb:
+            scene_3d_glb = predictions_to_glb(predictions, as_mesh=False)
+        if args.save_ply:
+            scene_3d_ply = predictions_to_ply(predictions, as_mesh=False)
 
     # Export GLB if requested
     if args.save_glb:
@@ -495,30 +521,34 @@ def main():
                 f"Saved {len(outputs)} processed input images to: {processed_images_dir}"
             )
 
-        # Stack all views
-        world_points = np.stack(world_points_list, axis=0)
-        images = np.stack(images_list, axis=0)
-        final_masks = np.stack(masks_list, axis=0)
-
-        # Create predictions dict for GLB export
-        predictions = {
-            "world_points": world_points,
-            "images": images,
-            "final_masks": final_masks,
-        }
-
-        # Convert to GLB scene
-        scene_3d = predictions_to_glb(predictions, as_mesh=True)
-
         # Save GLB file
-        scene_3d.export(glb_output_path)
+        scene_3d_glb.export(glb_output_path)
         print(f"Successfully saved GLB file: {glb_output_path}")
-        print(f"All outputs saved to: {scene_output_dir}")
     else:
-        print("Skipping GLB export (--save_glb not specified)")
         if args.save_input_images:
             print("Warning: --save_input_images has no effect without --save_glb")
 
+    # Export PLY if requested
+    if args.save_ply:
+        # Create output directory structure
+        scene_output_dir = args.output_directory
+        os.makedirs(scene_output_dir, exist_ok=True)
+        scene_prefix = os.path.basename(scene_output_dir)
+
+        ply_output_path = os.path.join(
+            scene_output_dir, f"{scene_prefix}_mapanything_colmap_output.ply"
+        )
+        print(f"Saving PLY file to: {ply_output_path}")
+
+        # Save PLY file
+        scene_3d_ply.export(ply_output_path, encoding='ascii')
+        print(f"Successfully saved PLY file: {ply_output_path}")
+
+    if not args.save_glb and not args.save_ply:
+        print("Skipping export (--save_glb or --save_ply not specified)")
+    else:
+        # Show output directory when any export is performed
+        print(f"All outputs saved to: {args.output_directory}")
 
 if __name__ == "__main__":
     main()
