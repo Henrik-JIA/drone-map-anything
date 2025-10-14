@@ -24,6 +24,7 @@ from mapanything.utils.geometry import depthmap_to_world_frame
 from mapanything.utils.image import load_images
 from mapanything.utils.viz import (
     predictions_to_glb,
+    predictions_to_ply,
     script_add_rerun_args,
 )
 
@@ -119,6 +120,19 @@ def get_parser():
         help="Output path for GLB file (default: output.glb)",
     )
 
+    parser.add_argument(
+        "--save_ply",
+        action="store_true",
+        default=False,
+        help="Save reconstruction as PLY file",
+    )
+    parser.add_argument(
+        "--ply_output_path",
+        type=str,
+        default="output.ply",
+        help="Output path for PLY file (default: output.ply)",
+    )
+
     return parser
 
 
@@ -187,7 +201,7 @@ def main():
         image_np = pred["img_no_norm"][0].cpu().numpy()
 
         # Store data for GLB export if needed
-        if args.save_glb:
+        if args.save_glb or args.save_ply:
             world_points_list.append(pts3d_np)
             images_list.append(image_np)
             masks_list.append(mask)
@@ -209,30 +223,46 @@ def main():
     if args.viz:
         print("Visualization complete! Check the Rerun viewer.")
 
-    # Export GLB if requested
-    if args.save_glb:
-        print(f"Saving GLB file to: {args.output_path}")
-
+    # Prepare data for export (if GLB or PLY export is requested)
+    if args.save_glb or args.save_ply:
         # Stack all views
         world_points = np.stack(world_points_list, axis=0)
         images = np.stack(images_list, axis=0)
         final_masks = np.stack(masks_list, axis=0)
 
-        # Create predictions dict for GLB export
+        # Create predictions dict for export
         predictions = {
             "world_points": world_points,
             "images": images,
             "final_masks": final_masks,
         }
 
-        # Convert to GLB scene
-        scene_3d = predictions_to_glb(predictions, as_mesh=True)
+        # Convert to 3D scene
+        if args.save_glb:
+            scene_3d_glb = predictions_to_glb(predictions, as_mesh=False)
+        if args.save_ply:
+            scene_3d_ply = predictions_to_ply(predictions, as_mesh=False)
 
-        # Save GLB file
-        scene_3d.export(args.output_path)
+    # Export GLB if requested
+    if args.save_glb:
+        print(f"Saving GLB file to: {args.output_path}")
+        output_dir = os.path.dirname(args.output_path)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
+        scene_3d_glb.export(args.output_path)
         print(f"Successfully saved GLB file: {args.output_path}")
-    else:
-        print("Skipping GLB export (--save_glb not specified)")
+
+    # Export PLY if requested
+    if args.save_ply:
+        print(f"Saving PLY file to: {args.ply_output_path}")
+        output_dir = os.path.dirname(args.ply_output_path)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
+            scene_3d_ply.export(args.ply_output_path, encoding='ascii')
+        print(f"Successfully saved PLY file: {args.ply_output_path}")
+
+    if not args.save_glb and not args.save_ply:
+        print("No export options specified. Use --save_glb or --save_ply to save output.")
 
 
 if __name__ == "__main__":

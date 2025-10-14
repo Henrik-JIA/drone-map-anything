@@ -264,3 +264,64 @@ def predictions_to_glb(
     scene_3d.apply_transform(rotation_matrix_x)
 
     return scene_3d
+
+
+def predictions_to_ply(
+    predictions,
+    as_mesh=True,
+):
+    """
+    Converts predictions to a point cloud or mesh that can be exported as PLY file.
+
+    Args:
+        predictions (dict): Dictionary containing model predictions with keys:
+            - world_points: 3D point coordinates (V, H, W, 3)
+            - images: Input images (V, H, W, 3)
+            - final_masks: Validity masks (V, H, W)
+        as_mesh (bool): Represent the data as a mesh instead of point cloud (default: True)
+
+    Returns:
+        trimesh.Trimesh or trimesh.PointCloud: 3D geometry that can be exported to PLY
+
+    Raises:
+        ValueError: If input predictions structure is invalid
+    """
+    if not isinstance(predictions, dict):
+        raise ValueError("predictions must be a dictionary")
+
+    # Get the world frame points and images from the predictions
+    pred_world_points = predictions["world_points"]
+    images = predictions["images"]
+
+    # Get the points and rgb
+    vertices_3d = pred_world_points.reshape(-1, 3)
+    # Handle different image formats - check if images need transposing
+    if images.ndim == 4 and images.shape[1] == 3:  # NCHW format
+        colors_rgb = np.transpose(images, (0, 2, 3, 1))
+    else:  # Assume already in NHWC format
+        colors_rgb = images
+    colors_rgb = (colors_rgb.reshape(-1, 3) * 255).astype(np.uint8)
+
+    # Apply mask to filter valid points
+    final_masks = predictions["final_masks"].reshape(-1)
+    vertices_3d = vertices_3d[final_masks].copy()
+    colors_rgb = colors_rgb[final_masks].copy()
+
+    # Apply 180° rotation around X-axis to fix orientation (upside-down issue)
+    rotation_matrix = np.array([
+        [1, 0, 0],
+        [0, -1, 0],
+        [0, 0, -1]
+    ], dtype=np.float32)
+    vertices_3d = vertices_3d @ rotation_matrix.T
+
+    if as_mesh:
+        # For mesh mode with multiple frames, we need to combine all frames
+        # This is complex, so for PLY we'll use point cloud mode with a warning
+        print("Warning: PLY export with as_mesh=True may not preserve mesh structure.")
+        print("Using point cloud export instead. For mesh export, use GLB format.")
+        as_mesh = False
+
+    # Create and return point cloud
+    point_cloud = trimesh.PointCloud(vertices=vertices_3d, colors=colors_rgb)
+    return point_cloud

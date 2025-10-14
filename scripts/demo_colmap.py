@@ -25,6 +25,7 @@ from PIL import Image
 from torchvision import transforms as tvf
 
 from mapanything.models import MapAnything
+from mapanything.utils.hf_utils.hf_helpers import initialize_mapanything_model
 from mapanything.third_party.np_to_pycolmap import (
     batch_np_matrix_to_pycolmap,
     batch_np_matrix_to_pycolmap_wo_track,
@@ -49,6 +50,12 @@ def parse_args():
         type=str,
         required=True,
         help="Directory containing the scene images",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Directory to save outputs (GLB file and sparse folder). Defaults to scene_dir if not specified.",
     )
     parser.add_argument(
         "--seed", type=int, default=42, help="Random seed for reproducibility"
@@ -389,6 +396,29 @@ def demo_fn(args):
     model = MapAnything.from_pretrained("facebook/map-anything").to(device)
     model.eval()
 
+    # # 添加配置字典
+    # high_level_config = {
+    #     "path": "configs/train.yaml",
+    #     "hf_model_name": "facebook/map-anything",
+    #     "model_str": "mapanything",
+    #     "config_overrides": [
+    #         "machine=aws",
+    #         "model=mapanything",
+    #         "model/task=images_only",
+    #         "model.encoder.uses_torch_hub=false",
+    #     ],
+    #     "checkpoint_name": "model.safetensors",
+    #     "config_name": "config.json",
+    #     "trained_with_amp": True,
+    #     "trained_with_amp_dtype": "bf16",
+    #     "data_norm_type": "dinov2",
+    #     "patch_size": 14,
+    #     "resolution": 518,
+    # }
+    # # 使用 initialize_mapanything_model 而不是 from_pretrained
+    # model = initialize_mapanything_model(high_level_config, torch.device(device))
+    # model.eval()
+
     # Get image paths and preprocess them
     image_dir = os.path.join(args.scene_dir, "images")
     image_path_list = glob.glob(os.path.join(image_dir, "*"))
@@ -407,6 +437,10 @@ def demo_fn(args):
     images = images.to(device)
     original_coords = original_coords.to(device)
     print(f"Loaded {len(images)} images from {image_dir}")
+
+    # Determine output directory
+    output_dir = args.output_dir if args.output_dir is not None else args.scene_dir
+    print(f"Output directory: {output_dir}")
 
     # Run MapAnything to estimate camera and depth
     # Run with 518 x 518 images
@@ -553,19 +587,19 @@ def demo_fn(args):
         shared_camera=shared_camera,
     )
 
-    print(f"Saving reconstruction to {args.scene_dir}/sparse")
-    sparse_reconstruction_dir = os.path.join(args.scene_dir, "sparse")
+    print(f"Saving reconstruction to {output_dir}/sparse")
+    sparse_reconstruction_dir = os.path.join(output_dir, "sparse")
     os.makedirs(sparse_reconstruction_dir, exist_ok=True)
-    reconstruction.write(sparse_reconstruction_dir)
+    reconstruction.write_text(sparse_reconstruction_dir)
 
     # Save point cloud for fast visualization
     trimesh.PointCloud(points_3d, colors=points_rgb).export(
-        os.path.join(args.scene_dir, "sparse/points.ply")
+        os.path.join(output_dir, "sparse/points.ply")
     )
 
     # Export GLB if requested
     if args.save_glb:
-        glb_output_path = os.path.join(args.scene_dir, "dense_mesh.glb")
+        glb_output_path = os.path.join(output_dir, "dense_mesh.glb")
         print(f"Saving GLB file to: {glb_output_path}")
 
         # Stack all views
@@ -581,7 +615,7 @@ def demo_fn(args):
         }
 
         # Convert to GLB scene
-        scene_3d = predictions_to_glb(predictions, as_mesh=True)
+        scene_3d = predictions_to_glb(predictions, as_mesh=False)
 
         # Save GLB file
         scene_3d.export(glb_output_path)

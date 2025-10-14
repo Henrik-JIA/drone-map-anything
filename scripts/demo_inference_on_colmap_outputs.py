@@ -288,9 +288,9 @@ def get_parser():
     parser.add_argument(
         "--ext",
         type=str,
-        default=".bin",
+        default=".txt",
         choices=[".bin", ".txt"],
-        help="COLMAP file extension (default: .bin)",
+        help="COLMAP file extension (default: .txt)",
     )
     parser.add_argument(
         "--memory_efficient_inference",
