@@ -75,6 +75,7 @@ def predict_tracks(
     query_frame_indexes = [0, *query_frame_indexes]
 
     # TODO: add the functionality to handle the masks
+    # Initialize feature extractors
     keypoint_extractors = initialize_feature_extractors(
         max_query_pts, extractor_method=keypoint_extractor, device=device
     )

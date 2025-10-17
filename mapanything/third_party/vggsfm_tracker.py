@@ -118,6 +118,7 @@ class TrackerPredictor(nn.Module):
     def process_images_to_fmaps(self, images):
         """
         This function processes images for inference.
+        It uses the coarse_fnet to process the images and return the feature maps.
 
         Args:
             images (torch.Tensor): The images to be processed with shape S x 3 x H x W.
@@ -125,12 +126,14 @@ class TrackerPredictor(nn.Module):
         Returns:
             torch.Tensor: The processed feature maps.
         """
+        # Process the images to get the feature maps
+        # downsample the images if the coarse_down_ratio is greater than 1
         if self.coarse_down_ratio > 1:
             # whether or not scale down the input images to save memory
             fmaps = self.coarse_fnet(
                 F.interpolate(
                     images,
-                    scale_factor=1 / self.coarse_down_ratio,
+                    scale_factor=1 / self.coarse_down_ratio, 
                     mode="bilinear",
                     align_corners=True,
                 )

@@ -221,17 +221,20 @@ def initialize_feature_extractors(
 
     for method in methods:
         method = method.strip()
-        if method == "aliked":
+        if method == "aliked": 
+            # ALIKED is a feature extractor that uses the ALIKED algorithm to extract keypoints from an image.
             aliked_extractor = ALIKED(
                 max_num_keypoints=max_query_num, detection_threshold=det_thres
             )
             extractors["aliked"] = aliked_extractor.to(device).eval()
         elif method == "sp":
+            # SuperPoint is a feature extractor that uses the SuperPoint algorithm to extract keypoints from an image.
             sp_extractor = SuperPoint(
                 max_num_keypoints=max_query_num, detection_threshold=det_thres
             )
             extractors["sp"] = sp_extractor.to(device).eval()
         elif method == "sift":
+            # SIFT is a feature extractor that uses the SIFT algorithm to extract keypoints from an image.
             sift_extractor = SIFT(max_num_keypoints=max_query_num)
             extractors["sift"] = sift_extractor.to(device).eval()
         else:

@@ -16,6 +16,25 @@ from .utils import bilinear_sampler
 
 
 class BasicEncoder(nn.Module):
+    """
+    BasicEncoder is a 2D CNN network that encodes the input image into a feature map.
+
+    network structure:
+    Input: RGB image [B, 3, H, W]
+    ↓
+    Conv1 (7x7, stride=2) → shrink to H/2, W/2
+    ↓
+    Layer1 (stride=1) → 64 channels
+    Layer2 (stride=2) → 96 channels  → H/4, W/4
+    Layer3 (stride=2) → 128 channels → H/8, W/8
+    Layer4 (stride=2) → 128 channels → H/16, W/16
+    ↓
+    Upsample all layers to H/stride × W/stride
+    ↓
+    Concat [a, b, c, d] → Conv2 → Conv3
+    ↓
+    Output: feature map [B, 128, H/4, W/4]
+    """
     def __init__(self, input_dim=3, output_dim=128, stride=4):
         super(BasicEncoder, self).__init__()
 
@@ -92,6 +111,23 @@ class BasicEncoder(nn.Module):
 
 
 class ShallowEncoder(nn.Module):
+    """
+    ShallowEncoder is a 2D CNN network that encodes the input image into a feature map.
+
+    network structure:
+    Input: RGB image [B, 3, H, W]
+    ↓
+    Conv1 (3x3, stride=2) → H/2, W/2, 32 channels
+    ↓
+    Layer1 (stride=2) → H/4, W/4
+    Layer2 (stride=2) → H/8, W/8
+    ↓
+    Add features with skip connections
+    ↓
+    Upsample to H/stride × W/stride
+    ↓
+    Output: feature map [B, 32, H, W]
+    """
     def __init__(self, input_dim=3, output_dim=32, stride=1, norm_fn="instance"):
         super(ShallowEncoder, self).__init__()
         self.stride = stride
@@ -170,6 +206,30 @@ def _bilinear_intepolate(x, stride, H, W):
 class EfficientUpdateFormer(nn.Module):
     """
     Transformer model that updates track estimates.
+    Core tracking network, uses Transformer to update track estimates.
+
+    networkstructure:
+    Input: feature sequence [B, N, T, C]
+      B = batch size
+      N = number of tracking points
+      T = number of frames
+      C = feature dimension
+    ↓
+    Input Transform: Linear(C → hidden_size)
+    ↓
+    ┌─────────────────────────────────────────┐
+    │  Alternate time and space attention:    │
+    │                                         │
+    │  Time Attention (cross-frame attention) │
+    │    ↓                                    │
+    │  Space Attention (cross-point attention)│
+    │    - Virtual Tokens mechanism           │
+    │    - Point ↔ Virtual interaction        │
+    └─────────────────────────────────────────┘
+    ↓
+    Flow Head: Linear(hidden_size → output_dim)
+    ↓
+    Output: track updates [B, N, T, output_dim]
     """
 
     def __init__(
@@ -309,6 +369,9 @@ class EfficientUpdateFormer(nn.Module):
 
 
 class CorrBlock:
+    """
+    CorrBlock is a block that computes the correlation between the target features and the source features.
+    """
     def __init__(
         self,
         fmaps,
