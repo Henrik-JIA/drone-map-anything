@@ -115,6 +115,16 @@ def parse_args():
         default=True,
         help="Use fine tracking (slower but more accurate)",
     )
+    parser.add_argument(
+        "--max_points3D_val",
+        type=float,
+        default=3000.0,
+        help="Maximum absolute coordinate value for valid 3D points (checks each coordinate component relative to 0). "
+             "Points are kept only if abs(x) < threshold AND abs(y) < threshold AND abs(z) < threshold. "
+             "This defines a cubic region centered at origin, NOT a spherical distance filter. "
+             "Use larger values (e.g., 10000) for large-scale scenes, smaller values (e.g., 500) for indoor scenes. "
+             "Default: 3000.0",
+    )
     return parser.parse_args()
 
 
@@ -520,9 +530,11 @@ def demo_fn(args):
             image_size,
             masks=track_mask,
             max_reproj_error=args.max_reproj_error, # small than 8.0 pixel are retained
+            max_points3D_val=args.max_points3D_val,
             shared_camera=shared_camera, # 如果 shared_camera=False，每帧创建新的相机；如果 shared_camera=True，只在第一帧创建，后续帧复用。
             camera_type=args.camera_type,
             points_rgb=points_rgb,
+            min_inlier_per_frame=32,
         )
 
         if reconstruction is None:
@@ -588,6 +600,7 @@ def demo_fn(args):
             image_size,
             shared_camera=shared_camera,
             camera_type=camera_type,
+            max_points3D_val=args.max_points3D_val,
         )
 
         reconstruction_resolution = mapanything_fixed_resolution
@@ -629,12 +642,48 @@ def demo_fn(args):
         reconstruction.write_text(sparse_reconstruction_dir)
 
     if args.use_ba: # 使用BA
-        reconstruction.export_PLY(os.path.join(output_dir, "sparse/points.ply"))
+        reconstruction.export_PLY(os.path.join(output_dir, "sparse/points.ply")) # 二进制ply
+        # 额外导出ASCII版本（使用trimesh重新保存）
+        # 从reconstruction中提取点云数据
+        points = []
+        colors = []
+        for point3D_id in reconstruction.points3D:
+            point3D = reconstruction.points3D[point3D_id]
+            points.append(point3D.xyz)
+            colors.append(point3D.color)
+        
+        if len(points) > 0:
+            points = np.array(points)
+            colors = np.array(colors)
+            trimesh.PointCloud(points, colors=colors).export(
+                os.path.join(output_dir, "sparse/points_ascii.ply"),
+                encoding='ascii'  # ASCII格式
+            )
+            print(f"✓ Exported ASCII PLY: {output_dir}/sparse/points_ascii.ply")
     else:
+        # # Save point cloud for fast visualization
+        # trimesh.PointCloud(points_3d, colors=points_rgb).export(
+        #     os.path.join(output_dir, "sparse/points.ply"),encoding='ascii'
+        # )
         # Save point cloud for fast visualization
-        trimesh.PointCloud(points_3d, colors=points_rgb).export(
-            os.path.join(output_dir, "sparse/points.ply")
-        )
+        # 从 reconstruction 对象中提取点云（已经过 max_points3D_val 过滤）
+        points = []
+        colors = []
+        for point3D_id in reconstruction.points3D:
+            point3D = reconstruction.points3D[point3D_id]
+            points.append(point3D.xyz)
+            colors.append(point3D.color)
+        
+        if len(points) > 0:
+            points = np.array(points)
+            colors = np.array(colors)
+            trimesh.PointCloud(points, colors=colors).export(
+                os.path.join(output_dir, "sparse/points.ply"),
+                encoding='ascii'
+            )
+            print(f"Saved {len(points)} points to sparse/points.ply (after max_points3D_val={args.max_points3D_val} filtering)")
+        else:
+            print("Warning: No valid points to save after filtering")
 
     # Export GLB if requested
     if args.save_glb:

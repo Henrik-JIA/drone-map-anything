@@ -143,7 +143,7 @@ def batch_np_matrix_to_pycolmap(
         for point3D_id in range(1, num_points3D + 1):
             original_track_idx = valid_idx[point3D_id - 1] # 获取这个3D点在照片中的索引
 
-            if (reconstruction.points3D[point3D_id].xyz < max_points3D_val).all(): # 检查3D点是否合理，因为太远的点（比如坐标是10000）可能是异常值或错误
+            if (np.abs(reconstruction.points3D[point3D_id].xyz) < max_points3D_val).all(): # 检查3D点是否合理，因为太远的点（比如坐标是10000）可能是异常值或错误
                 if masks[fidx][original_track_idx]: # 检查这个点在当前照片中是否可见
                     # 记录"照片→3D点"的关系
                     # 第0个点(x,y) → 3D点id_1
@@ -179,6 +179,17 @@ def batch_np_matrix_to_pycolmap(
         # add image
         reconstruction.add_image(image)
 
+    # Clean up 3D points without track elements (filtered by coordinate check)
+    # 检查3D点是否存在2D关联，如果不存在则删除
+    points_to_remove = [
+        point3D_id for point3D_id in reconstruction.points3D
+        if len(reconstruction.points3D[point3D_id].track.elements) == 0
+    ]
+    for point3D_id in points_to_remove:
+        del reconstruction.points3D[point3D_id]
+    if points_to_remove:
+        print(f"Removed {len(points_to_remove)} points without 2D associations")
+    
     return reconstruction, valid_mask
 
 
@@ -246,6 +257,7 @@ def batch_np_matrix_to_pycolmap_wo_track(
     image_size,
     shared_camera=False,
     camera_type="SIMPLE_PINHOLE",
+    max_points3D_val=3000,
 ):
     """
     Convert Batched NumPy Arrays to PyCOLMAP
@@ -265,8 +277,23 @@ def batch_np_matrix_to_pycolmap_wo_track(
     # where N is the number of frames and P is the number of tracks
 
     N = len(extrinsics)
-    P = len(points3d)
+    P_original = len(points3d)
 
+    valid_mask = (np.abs(points3d) < max_points3D_val).all(axis=1)
+    points3d = points3d[valid_mask]
+    points_xyf = points_xyf[valid_mask]
+    points_rgb = points_rgb[valid_mask]
+    P = len(points3d)
+    
+    if P == 0:
+        print("Error: No valid points after filtering outliers")
+        return None
+    
+    if P < P_original:
+        print(f"Filtered {P_original - P} outlier points (coords >= {max_points3D_val}), "
+              f"{P} points remaining ({100*P/P_original:.1f}%)")
+
+    
     # Reconstruction object, following the format of PyCOLMAP/COLMAP
     reconstruction = pycolmap.Reconstruction()
 
@@ -332,6 +359,17 @@ def batch_np_matrix_to_pycolmap_wo_track(
 
         # add image
         reconstruction.add_image(image)
+
+    # Clean up 3D points without track elements
+    # 检查3D点是否存在2D关联，如果不存在则删除
+    points_to_remove = [
+        point3D_id for point3D_id in reconstruction.points3D
+        if len(reconstruction.points3D[point3D_id].track.elements) == 0
+    ]
+    for point3D_id in points_to_remove:
+        del reconstruction.points3D[point3D_id]
+    if points_to_remove:
+        print(f"Removed {len(points_to_remove)} points without 2D associations")
 
     return reconstruction
 
