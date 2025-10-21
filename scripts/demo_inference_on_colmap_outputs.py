@@ -267,6 +267,71 @@ def log_data_to_rerun(
         ),
     )
 
+def recover_colmap_scale(outputs, original_poses, ignore_pose_inputs=False):
+    """
+    Recover COLMAP scale by comparing input and output camera poses.
+    
+    Args:
+        outputs: List of model output dictionaries
+        original_poses: List of original COLMAP pose tensors (4x4 matrices)
+        ignore_pose_inputs: Whether pose inputs were ignored during inference
+        
+    Returns:
+        outputs: Modified outputs with corrected scale
+        scale_ratio: The computed scale ratio (or None if not computed)
+    """
+    if len(original_poses) == 0 or ignore_pose_inputs:
+        print("Skipping scale recovery (no input poses or pose inputs ignored)")
+        return outputs, None
+    
+    # Compute scale factor from pose comparison
+    # Compare camera positions from input vs output
+    device = outputs[0]["camera_poses"].device
+    input_positions = torch.stack([p[:3, 3].to(device) for p in original_poses])  # (N, 3)
+    output_positions = torch.stack([outputs[i]["camera_poses"][0, :3, 3] for i in range(len(outputs))])  # (N, 3)
+    
+    # Compute pairwise distances
+    input_dists = torch.cdist(input_positions, input_positions)  # (N, N)
+    output_dists = torch.cdist(output_positions, output_positions)  # (N, N)
+    
+    # Get valid pairs (non-zero distances)
+    valid_mask = input_dists > 1e-6
+    
+    if valid_mask.sum() == 0:
+        print("Warning: Could not compute scale ratio (insufficient camera movement)")
+        return outputs, None
+    
+    # Compute scale ratio
+    scale_ratio = (input_dists[valid_mask] / (output_dists[valid_mask] + 1e-8)).median()
+    
+    print(f"Detected scale ratio COLMAP/MapAnything: {scale_ratio.item():.6f}")
+    print(f"Applying scale correction to outputs...")
+    
+    # Apply scale correction to all outputs
+    for view_idx, pred in enumerate(outputs):
+        # Clone tensors to allow modification (inference tensors are read-only)
+        # Scale depth
+        pred["depth_z"] = pred["depth_z"].clone() * scale_ratio
+        if "depth_along_ray" in pred:
+            pred["depth_along_ray"] = pred["depth_along_ray"].clone() * scale_ratio
+        
+        # Scale camera positions
+        camera_poses_scaled = pred["camera_poses"].clone()
+        camera_poses_scaled[0, :3, 3] = camera_poses_scaled[0, :3, 3] * scale_ratio
+        pred["camera_poses"] = camera_poses_scaled
+        
+        if "cam_trans" in pred:
+            pred["cam_trans"] = pred["cam_trans"].clone() * scale_ratio
+        
+        # Scale 3D points in camera frame
+        if "pts3d_cam" in pred:
+            pred["pts3d_cam"] = pred["pts3d_cam"].clone() * scale_ratio
+        
+        # Update metric scaling factor
+        if "metric_scaling_factor" in pred:
+            pred["metric_scaling_factor"] = pred["metric_scaling_factor"].clone() * scale_ratio
+    
+    return outputs, scale_ratio
 
 def get_parser():
     """Create argument parser"""
@@ -421,6 +486,19 @@ def main():
         rr.script_setup(args, viz_string)
         rr.set_time("stable_time", sequence=0)
         rr.log("mapanything", rr.ViewCoordinates.RDF, static=True)
+
+    # Store original COLMAP poses for scale recovery
+    original_poses = []
+    for view in views_example:
+        if "camera_poses" in view:
+            original_poses.append(view["camera_poses"].clone())
+    
+    # Recover COLMAP scale
+    outputs, scale_ratio = recover_colmap_scale(
+        outputs, 
+        original_poses, 
+        ignore_pose_inputs=args.ignore_pose_inputs
+    )
 
     # Loop through the outputs
     for view_idx, pred in enumerate(outputs):
