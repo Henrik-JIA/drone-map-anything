@@ -431,6 +431,7 @@ def demo_fn(args):
     mapanything_fixed_resolution = 518
     img_load_resolution = 1024
 
+    # this function preprocesses images to the model's input format while preserving original information for later restoration.
     images, original_coords = load_and_preprocess_images_square(
         image_path_list, img_load_resolution, model.encoder.data_norm_type
     )
@@ -469,7 +470,7 @@ def demo_fn(args):
             world_points_list.append(points_3d[i])
             masks_list.append(masks[i])  # Use masks from predictions
 
-    if args.use_ba:
+    if args.use_ba: # 使用BA
         image_size = np.array(images.shape[-2:])
         scale = img_load_resolution / mapanything_fixed_resolution
         shared_camera = args.shared_camera
@@ -494,9 +495,22 @@ def demo_fn(args):
             torch.cuda.empty_cache()
 
         # Rescale the intrinsic matrix from 518 to 1024
+        # MapAnything 在 518×518 分辨率下预测了相机内参，但后续的点跟踪（track prediction）是在 1024×1024 的图像上进行的，图像分辨率变化时，焦距和主点坐标都需要等比例缩放。
         intrinsic[:, :2, :] *= scale
+        # 创建可见性掩码，过滤低置信度的跟踪点
         track_mask = pred_vis_scores > args.vis_thresh
 
+
+        # 深度学习模型输出          batch_np_matrix_to_pycolmap          COLMAP格式
+        # ├─ NumPy数组      ─────────────────────────────────────►     ├─ Cameras
+        # ├─ 3D点云                    【翻译+质检】                    ├─ Images  
+        # ├─ 相机参数                                                  ├─ Points3D
+        # └─ 特征轨迹                                                  └─ Tracks
+        #                                   ↓
+        #                              Bundle Adjustment
+        #                              （捆集调整优化）
+        #                                   ↓
+        #                             优化后的重建结果
         # Init pycolmap reconstruction
         reconstruction, valid_track_mask = batch_np_matrix_to_pycolmap(
             points_3d,
@@ -505,8 +519,8 @@ def demo_fn(args):
             pred_tracks,
             image_size,
             masks=track_mask,
-            max_reproj_error=args.max_reproj_error,
-            shared_camera=shared_camera,
+            max_reproj_error=args.max_reproj_error, # small than 8.0 pixel are retained
+            shared_camera=shared_camera, # 如果 shared_camera=False，每帧创建新的相机；如果 shared_camera=True，只在第一帧创建，后续帧复用。
             camera_type=args.camera_type,
             points_rgb=points_rgb,
         )
@@ -578,24 +592,49 @@ def demo_fn(args):
 
         reconstruction_resolution = mapanything_fixed_resolution
 
-    reconstruction = rename_colmap_recons_and_rescale_camera(
-        reconstruction,
-        base_image_path_list,
-        original_coords.cpu().numpy(),
-        img_size=reconstruction_resolution,
-        shift_point2d_to_original_res=True,
-        shared_camera=shared_camera,
-    )
+    # 重命名和缩放相机参数
+    # 将基于处理后图像的重建结果，还原到原始图像尺寸
+    # 处理流程中，原始图像被缩放到1024*1024尺寸，之后模型推理尺寸是518*518，重建结果（相机参数基于处理后的图像尺寸）需要缩放到原始图像尺寸。
+    if args.use_ba: # 使用BA
+        reconstruction = rename_colmap_recons_and_rescale_camera(
+            reconstruction,
+            base_image_path_list,
+            original_coords.cpu().numpy(),
+            img_size=reconstruction_resolution,
+            shift_point2d_to_original_res=True,
+            shared_camera=shared_camera,
+            resample_colors_from_original=True,   
+            original_images_dir=image_dir,              
+        )
 
-    print(f"Saving reconstruction to {output_dir}/sparse")
-    sparse_reconstruction_dir = os.path.join(output_dir, "sparse")
-    os.makedirs(sparse_reconstruction_dir, exist_ok=True)
-    reconstruction.write_text(sparse_reconstruction_dir)
+        print(f"Saving reconstruction to {output_dir}/sparse")
+        sparse_reconstruction_dir = os.path.join(output_dir, "sparse")
+        os.makedirs(sparse_reconstruction_dir, exist_ok=True)
+        reconstruction.write_text(sparse_reconstruction_dir)
+    else:
+        reconstruction = rename_colmap_recons_and_rescale_camera(
+            reconstruction,
+            base_image_path_list,
+            original_coords.cpu().numpy(),
+            img_size=reconstruction_resolution,
+            shift_point2d_to_original_res=True,
+            shared_camera=shared_camera,
+            resample_colors_from_original=False,   
+            original_images_dir=image_dir,              
+        )
 
-    # Save point cloud for fast visualization
-    trimesh.PointCloud(points_3d, colors=points_rgb).export(
-        os.path.join(output_dir, "sparse/points.ply")
-    )
+        print(f"Saving reconstruction to {output_dir}/sparse")
+        sparse_reconstruction_dir = os.path.join(output_dir, "sparse")
+        os.makedirs(sparse_reconstruction_dir, exist_ok=True)
+        reconstruction.write_text(sparse_reconstruction_dir)
+
+    if args.use_ba: # 使用BA
+        reconstruction.export_PLY(os.path.join(output_dir, "sparse/points.ply"))
+    else:
+        # Save point cloud for fast visualization
+        trimesh.PointCloud(points_3d, colors=points_rgb).export(
+            os.path.join(output_dir, "sparse/points.ply")
+        )
 
     # Export GLB if requested
     if args.save_glb:
@@ -631,6 +670,8 @@ def rename_colmap_recons_and_rescale_camera(
     img_size,
     shift_point2d_to_original_res=False,
     shared_camera=False,
+    resample_colors_from_original=False,  
+    original_images_dir=None,              
 ):
     rescale_camera = True
 
@@ -643,7 +684,7 @@ def rename_colmap_recons_and_rescale_camera(
 
         if rescale_camera:
             # Rescale the camera parameters
-            pred_params = copy.deepcopy(pycamera.params)
+            pred_params = copy.deepcopy(pycamera.params) # 深拷贝，避免修改原始对象影响其他引用
 
             real_image_size = original_coords[pyimageid - 1, -2:]
             resize_ratio = max(real_image_size) / img_size
@@ -661,6 +702,27 @@ def rename_colmap_recons_and_rescale_camera(
 
             for point2D in pyimage.points2D:
                 point2D.xy = (point2D.xy - top_left) * resize_ratio
+
+        if resample_colors_from_original and original_images_dir:
+            # 构建完整路径
+            original_image_path = os.path.join(original_images_dir, pyimage.name)
+            try:
+                original_image = Image.open(original_image_path).convert("RGB")
+                original_image_np = np.array(original_image)
+                
+                # 遍历这张图像看到的所有3D点
+                for point2D in pyimage.points2D:
+                    if point2D.point3D_id != -1:  # 有效的3D点
+                        x, y = int(point2D.xy[0]), int(point2D.xy[1])
+                        
+                        # 确保坐标在图像范围内
+                        if 0 <= x < original_image_np.shape[1] and 0 <= y < original_image_np.shape[0]:
+                            color = original_image_np[y, x]
+                            point3D = reconstruction.points3D[point2D.point3D_id]
+                            point3D.color = color
+            except Exception as e:
+                print(f"Warning: Failed to resample colors from {pyimage.name}: {e}")
+            
 
         if shared_camera:
             # If shared_camera, all images share the same camera

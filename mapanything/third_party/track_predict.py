@@ -86,6 +86,7 @@ def predict_tracks(
     pred_points_3d = []
     pred_colors = []
 
+    # Process the images to get the feature maps for the tracker
     fmaps_for_tracker = tracker.process_images_to_fmaps(images)
 
     if fine_tracking:
