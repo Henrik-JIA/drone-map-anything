@@ -79,6 +79,18 @@ def parse_args():
         help="Save dense reconstruction (without BA) as GLB file",
     )
     parser.add_argument(
+        "--filter_black_bg",
+        action="store_true",
+        default=False,
+        help="Filter out black background points (RGB sum < 16)",
+    )
+    parser.add_argument(
+        "--filter_white_bg",
+        action="store_true",
+        default=False,
+        help="Filter out white background points (all RGB > 240)",
+    )
+    parser.add_argument(
         "--use_ba", action="store_true", default=False, help="Use BA for reconstruction"
     )
     ######### BA parameters #########
@@ -230,6 +242,303 @@ def load_and_preprocess_images_square(
 
     return images, original_coords
 
+def load_and_preprocess_images_square_with_mode(
+    image_path_list, 
+    target_size=1024, 
+    data_norm_type=None,
+    scale_factor=1.0,
+    mode="edge"
+):
+    """
+    Load and preprocess images by center padding to square and resizing to target size.
+    Uses smart padding to avoid black borders, or stretch mode to avoid padding entirely.
+    
+    Args:
+        image_path_list (list): List of paths to image files
+        target_size (int, optional): Target size for both width and height. Defaults to 1024.
+        data_norm_type (str, optional): Image normalization type. Defaults to None (no normalization).
+        scale_factor (float, optional): Downsample factor before processing. 1.0 means no downsampling. Defaults to 1.0.
+        mode (str, optional): Padding/resize mode. Options:
+            - "stretch": Stretch image to square (changes aspect ratio, no padding)
+            - "black": Black padding (original behavior)
+            - "white": White padding
+            - "gray": Gray padding (128, 128, 128)
+            - "edge": Use average edge color (smart padding, recommended)
+            - "no_padding": Keep original aspect ratio, pad to common size for batching
+            Defaults to "edge".
+    
+    Returns:
+        tuple: (
+            torch.Tensor: Batched tensor of preprocessed images with shape (N, 3, H, W)
+                         For most modes: H=W=target_size
+                         For "no_padding": H and W are the max dimensions across all images
+            torch.Tensor: Array of shape (N, 6) containing [x1, y1, x2, y2, width, height] for each image
+        )
+    
+    Raises:
+        ValueError: If the input list is empty or if an invalid data_norm_type is provided
+    """
+    # Check for empty list
+    if len(image_path_list) == 0:
+        raise ValueError("At least 1 image is required")
+
+    images = []
+    original_coords = []
+    processed_pil_images = []  # Store PIL images before converting to tensor (for no_padding mode)
+
+    # Set up normalization based on data_norm_type
+    if data_norm_type is None:
+        img_transform = tvf.ToTensor()
+    elif data_norm_type in IMAGE_NORMALIZATION_DICT.keys():
+        img_norm = IMAGE_NORMALIZATION_DICT[data_norm_type]
+        img_transform = tvf.Compose(
+            [tvf.ToTensor(), tvf.Normalize(mean=img_norm.mean, std=img_norm.std)]
+        )
+    else:
+        raise ValueError(
+            f"Unknown image normalization type: {data_norm_type}. "
+            f"Available options: {list(IMAGE_NORMALIZATION_DICT.keys())}"
+        )
+
+    for image_path in image_path_list:
+        # Open image using PIL
+        img = Image.open(image_path)
+        
+        # If there's an alpha channel, blend onto white background
+        if img.mode == "RGBA":
+            background = Image.new("RGBA", img.size, (255, 255, 255, 255))
+            img = Image.alpha_composite(background, img)
+        
+        # Convert to RGB
+        img = img.convert("RGB")
+        
+        # Optional downsampling before padding/stretching
+        if scale_factor != 1.0:
+            orig_w, orig_h = img.size
+            new_w = int(orig_w * scale_factor)
+            new_h = int(orig_h * scale_factor)
+            img = img.resize((new_w, new_h), Image.Resampling.AREA)
+        
+        # Get original dimensions
+        width, height = img.size
+        
+        # Handle different modes
+        if mode == "stretch":
+            # ========== STRETCH MODE: 直接拉伸到正方形 ==========
+            square_img = img.resize((target_size, target_size), Image.Resampling.BICUBIC)
+            x1 = 0
+            y1 = 0
+            x2 = target_size
+            y2 = target_size
+            original_coords.append(np.array([x1, y1, x2, y2, width, height]))
+            # ====================================================
+        elif mode == "no_padding":
+            # ========== NO PADDING MODE: 保持原始宽高比 ==========
+            # Calculate coordinate transformation info (as if it would be padded to square)
+            max_dim = max(width, height)
+            left = (max_dim - width) // 2
+            top = (max_dim - height) // 2
+            scale = target_size / max_dim
+            
+            x1 = left * scale
+            y1 = top * scale
+            x2 = (left + width) * scale
+            y2 = (top + height) * scale
+            
+            original_coords.append(np.array([x1, y1, x2, y2, width, height]))
+            
+            # 保持原始图像，不做padding（稍后统一处理）
+            square_img = img
+            processed_pil_images.append(img)
+            # ====================================================
+        else:
+            # ========== PADDING MODES: 保持宽高比 + 填充 ==========
+            max_dim = max(width, height)
+            left = (max_dim - width) // 2
+            top = (max_dim - height) // 2
+            scale = target_size / max_dim
+            
+            x1 = left * scale
+            y1 = top * scale
+            x2 = (left + width) * scale
+            y2 = (top + height) * scale
+            
+            original_coords.append(np.array([x1, y1, x2, y2, width, height]))
+            
+            # Determine padding color based on mode
+            if mode == "black":
+                pad_color = (0, 0, 0)
+            elif mode == "white":
+                pad_color = (255, 255, 255)
+            elif mode == "gray":
+                pad_color = (128, 128, 128)
+            elif mode == "edge":
+                # Smart padding: use average edge color
+                img_array = np.array(img)
+                top_edge = img_array[0, :, :]
+                bottom_edge = img_array[-1, :, :]
+                left_edge = img_array[:, 0, :]
+                right_edge = img_array[:, -1, :]
+                edge_pixels = np.vstack([top_edge, bottom_edge, left_edge, right_edge])
+                pad_color = tuple(edge_pixels.mean(axis=0).astype(int).tolist())
+            else:
+                raise ValueError(
+                    f"Invalid mode: {mode}. "
+                    f"Options: 'stretch', 'black', 'white', 'gray', 'edge', 'no_padding'"
+                )
+            
+            # Create square image with padding
+            square_img = Image.new("RGB", (max_dim, max_dim), pad_color)
+            square_img.paste(img, (left, top))
+            square_img = square_img.resize(
+                (target_size, target_size), Image.Resampling.BICUBIC
+            )
+            # ====================================================
+        
+        # Convert to tensor (except for no_padding mode, handled later)
+        if mode != "no_padding":
+            img_tensor = img_transform(square_img)
+            images.append(img_tensor)
+
+    # Convert coordinates to tensor
+    original_coords = torch.from_numpy(np.array(original_coords)).float()
+    
+    # Special handling for no_padding mode: pad all images to same size for batching
+    if mode == "no_padding":
+        # Find max width and height across all images
+        max_width = max(img.size[0] for img in processed_pil_images)
+        max_height = max(img.size[1] for img in processed_pil_images)
+        
+        # Pad each image to (max_height, max_width) with black padding
+        for img in processed_pil_images:
+            width, height = img.size
+            # Create canvas with max dimensions
+            padded_img = Image.new("RGB", (max_width, max_height), (0, 0, 0))
+            # Paste original image at top-left (or center if you prefer)
+            padded_img.paste(img, (0, 0))
+            # Convert to tensor
+            img_tensor = img_transform(padded_img)
+            images.append(img_tensor)
+    
+    # Stack all images
+    images = torch.stack(images)
+    
+    # Add additional dimension if single image to ensure correct shape
+    if len(image_path_list) == 1:
+        if images.dim() == 3:
+            images = images.unsqueeze(0)
+            original_coords = original_coords.unsqueeze(0)
+    
+    return images, original_coords
+
+def load_and_downsample_images_rgb_with_coords(
+    image_paths, 
+    target_width=518, 
+    scale_factor=1.0,
+    data_norm_type=None
+):
+    """
+    Load, optionally downsample images in RGB format, and calculate coordinate transformation info in one pass.
+    
+    Args:
+        image_paths (List[Path] or List[str]): List of paths to image files
+        target_width (int): Target width for coordinate calculation. Defaults to 518.
+        scale_factor (float): Factor to downsample images. 1.0 means no downsampling. Defaults to 1.0.
+        data_norm_type (str, optional): Image normalization type. Defaults to None (no normalization).
+    
+    Returns:
+        tuple: (
+            torch.Tensor: Batched tensor of images with shape (N, 3, H, W) where H and W 
+                         are the max height and width across all images (after downsampling).
+            torch.Tensor: Array of shape (N, 6) containing [x1, y1, x2, y2, width, height] for each image.
+                         width and height are from the (possibly downsampled) image.
+        )
+    """
+    # Set up normalization based on data_norm_type
+    if data_norm_type is None:
+        img_transform = tvf.ToTensor()
+    elif data_norm_type in IMAGE_NORMALIZATION_DICT.keys():
+        img_norm = IMAGE_NORMALIZATION_DICT[data_norm_type]
+        img_transform = tvf.Compose(
+            [tvf.ToTensor(), tvf.Normalize(mean=img_norm.mean, std=img_norm.std)]
+        )
+    else:
+        raise ValueError(
+            f"Unknown image normalization type: {data_norm_type}. "
+            f"Available options: {list(IMAGE_NORMALIZATION_DICT.keys())}"
+        )
+    
+    pil_images = []
+    coords_data = []
+    
+    for image_path in image_paths:
+        # Load image using PIL
+        img = Image.open(image_path)
+        
+        # If there's an alpha channel, blend onto white background
+        if img.mode == "RGBA":
+            background = Image.new("RGBA", img.size, (255, 255, 255, 255))
+            img = Image.alpha_composite(background, img)
+        
+        # Convert to RGB
+        img = img.convert("RGB")
+        
+        # Downsample if scale_factor is not 1.0
+        if scale_factor != 1.0:
+            orig_w, orig_h = img.size
+            new_w = int(orig_w * scale_factor)
+            new_h = int(orig_h * scale_factor)
+            img = img.resize((new_w, new_h), Image.Resampling.AREA)
+        
+        pil_images.append(img)
+        
+        # Get dimensions for coordinate calculation
+        width, height = img.size
+        
+        # Calculate coordinate transformation info
+        max_dim = max(width, height)
+        left = (max_dim - width) // 2
+        top = (max_dim - height) // 2
+        scale = target_width / max_dim
+        
+        # Calculate final coordinates of original image in target space
+        x1 = left * scale
+        y1 = top * scale
+        x2 = (left + width) * scale
+        y2 = (top + height) * scale
+        
+        # Store image coordinates and scale
+        coords_data.append([x1, y1, x2, y2, width, height])
+    
+    # Find max width and height across all images for batching
+    max_width = max(img.size[0] for img in pil_images)
+    max_height = max(img.size[1] for img in pil_images)
+    
+    # Pad all images to same size with black padding and convert to tensors
+    images = []
+    for img in pil_images:
+        width, height = img.size
+        # Create canvas with max dimensions (black background)
+        padded_img = Image.new("RGB", (max_width, max_height), (0, 0, 0))
+        # Paste original image at top-left
+        padded_img.paste(img, (0, 0))
+        # Convert to tensor with normalization
+        img_tensor = img_transform(padded_img)
+        images.append(img_tensor)
+    
+    # Stack into batched tensor
+    images = torch.stack(images)
+    
+    # Convert coordinates to tensor
+    coords_data = torch.tensor(coords_data, dtype=torch.float32)
+    
+    # Add additional dimension if single image
+    if len(image_paths) == 1:
+        if images.dim() == 3:
+            images = images.unsqueeze(0)
+            coords_data = coords_data.unsqueeze(0)
+    
+    return images, coords_data
 
 def randomly_limit_trues(mask: np.ndarray, max_trues: int) -> np.ndarray:
     """
@@ -442,12 +751,39 @@ def demo_fn(args):
     img_load_resolution = 1024
 
     # this function preprocesses images to the model's input format while preserving original information for later restoration.
-    images, original_coords = load_and_preprocess_images_square(
-        image_path_list, img_load_resolution, model.encoder.data_norm_type
+    # images, original_coords = load_and_preprocess_images_square(
+    #     image_path_list, img_load_resolution, model.encoder.data_norm_type
+    # )
+    # padding_mode: "no_padding", "stretch", "black", "white", "gray", "edge"
+    images, original_coords = load_and_preprocess_images_square_with_mode(
+        image_path_list, img_load_resolution, model.encoder.data_norm_type, mode="black"
     )
     images = images.to(device)
     original_coords = original_coords.to(device)
     print(f"Loaded {len(images)} images from {image_dir}")
+
+    # # 快速保存并展示第一张处理后的图像
+    # if len(images) > 0:
+    #     import matplotlib.pyplot as plt
+        
+    #     img_to_show = images[0].cpu()
+        
+    #     # 反归一化
+    #     if model.encoder.data_norm_type in IMAGE_NORMALIZATION_DICT.keys():
+    #         img_norm = IMAGE_NORMALIZATION_DICT[model.encoder.data_norm_type]
+    #         mean = torch.tensor(img_norm.mean).view(3, 1, 1)
+    #         std = torch.tensor(img_norm.std).view(3, 1, 1)
+    #         img_to_show = img_to_show * std + mean
+        
+    #     img_to_show = img_to_show.permute(1, 2, 0).numpy().clip(0, 1)
+        
+    #     plt.figure(figsize=(8, 8))
+    #     plt.imshow(img_to_show)
+    #     plt.title(f'Preprocessed Image', fontsize=14)
+    #     plt.axis('off')
+    #     # 显示窗口（非阻塞模式，程序继续运行）
+    #     plt.show(block=False)
+    #     print("✓ Image window displayed (you can continue working)")
 
     # Determine output directory
     output_dir = args.output_dir if args.output_dir is not None else args.scene_dir
@@ -582,13 +918,82 @@ def demo_fn(args):
         # (S, H, W, 3), with x, y coordinates and frame indices
         points_xyf = create_pixel_coordinate_grid(num_frames, height, width)
 
-        conf_mask = depth_conf >= conf_thres_value
-        # At most writing 100000 3d points to colmap reconstruction object
-        conf_mask = randomly_limit_trues(conf_mask, max_points_for_colmap)
+        # ========== 新增：创建padding区域的mask ==========
+        # 将original_coords转为numpy（如果还是tensor）
+        original_coords_np = original_coords.cpu().numpy() if isinstance(original_coords, torch.Tensor) else original_coords
+        
+        # 创建一个mask，标记哪些点在有效区域内
+        padding_mask = np.ones((num_frames, height, width), dtype=bool)
+        
+        for frame_idx in range(num_frames):
+            # 获取该帧的有效区域边界 [x1, y1, x2, y2, width, height]
+            x1, y1, x2, y2 = original_coords_np[frame_idx, :4]
+            
+            # 创建该帧的padding mask
+            # 只有在 [x1, y1] 到 [x2, y2] 范围内的点才是有效的
+            y_coords, x_coords = np.indices((height, width))
+            
+            # 检查每个点是否在有效区域内
+            valid_x = (x_coords >= x1) & (x_coords <= x2)
+            valid_y = (y_coords >= y1) & (y_coords <= y2)
+            padding_mask[frame_idx] = valid_x & valid_y
+        
+        print(f"Padding mask created: {padding_mask.sum()} valid points out of {padding_mask.size} total points")
+        # ====================================================
 
-        points_3d = points_3d[conf_mask]
-        points_xyf = points_xyf[conf_mask]
-        points_rgb = points_rgb[conf_mask]
+        # 应用confidence和padding mask
+        conf_mask = depth_conf >= conf_thres_value
+        
+        # 合并两个mask
+        combined_mask = conf_mask & padding_mask
+        
+        # ========== 新增：黑色/白色背景过滤 ==========
+        # 添加命令行参数控制（需要在 parse_args() 中添加）
+        filter_black_bg = args.filter_black_bg  # 或者从 args.filter_black_bg 获取
+        filter_white_bg = args.filter_white_bg  # 或者从 args.filter_white_bg 获取
+
+        if filter_black_bg or filter_white_bg:
+            # points_rgb 的形状是 (num_frames, height, width, 3)，值在 [0, 255]
+            
+            # 创建背景过滤mask
+            bg_mask = np.ones((num_frames, height, width), dtype=bool)
+            
+            if filter_black_bg:
+                # 过滤黑色背景：RGB总和 < 16 的像素
+                rgb_sum = points_rgb.sum(axis=-1)  # (num_frames, height, width)
+                black_bg_mask = rgb_sum >= 1
+                bg_mask = bg_mask & black_bg_mask
+                print(f"Black background filtering: removed {(~black_bg_mask).sum()} points")
+            
+            if filter_white_bg:
+                # 过滤白色背景：所有RGB通道 > 240 的像素
+                white_bg_mask = ~(
+                    (points_rgb[:, :, :, 0] > 240) &
+                    (points_rgb[:, :, :, 1] > 240) &
+                    (points_rgb[:, :, :, 2] > 240)
+                )
+                bg_mask = bg_mask & white_bg_mask
+                print(f"White background filtering: removed {(~white_bg_mask).sum()} points")
+            
+            # 合并背景过滤mask
+            combined_mask = combined_mask & bg_mask
+
+        # ====================================================
+
+        # At most writing max_points_for_colmap 3d points to colmap reconstruction object
+        combined_mask = randomly_limit_trues(combined_mask, max_points_for_colmap)
+
+        # 应用mask过滤点云
+        points_3d = points_3d[combined_mask]
+        points_xyf = points_xyf[combined_mask]
+        points_rgb = points_rgb[combined_mask]
+        
+        print(f"After filtering: {len(points_3d)} points remaining")
+        print(f"  - Confidence filtering: removed {(~conf_mask).sum()} points")
+        print(f"  - Padding filtering: removed {(~padding_mask).sum()} points")
+        if filter_black_bg or filter_white_bg:
+            print(f"  - Background filtering: removed {(~bg_mask).sum()} points")
+        print(f"  - Random sampling: limited to {max_points_for_colmap} points")
 
         print("Converting to COLMAP format")
         reconstruction = batch_np_matrix_to_pycolmap_wo_track(
@@ -608,7 +1013,7 @@ def demo_fn(args):
     # 重命名和缩放相机参数
     # 将基于处理后图像的重建结果，还原到原始图像尺寸
     # 处理流程中，原始图像被缩放到1024*1024尺寸，之后模型推理尺寸是518*518，重建结果（相机参数基于处理后的图像尺寸）需要缩放到原始图像尺寸。
-    if args.use_ba: # 使用BA
+    if args.use_ba:
         reconstruction = rename_colmap_recons_and_rescale_camera(
             reconstruction,
             base_image_path_list,
@@ -617,13 +1022,9 @@ def demo_fn(args):
             shift_point2d_to_original_res=True,
             shared_camera=shared_camera,
             resample_colors_from_original=True,   
-            original_images_dir=image_dir,              
+            original_images_dir=image_dir,
+            remove_padding_points=True,
         )
-
-        print(f"Saving reconstruction to {output_dir}/sparse")
-        sparse_reconstruction_dir = os.path.join(output_dir, "sparse")
-        os.makedirs(sparse_reconstruction_dir, exist_ok=True)
-        reconstruction.write_text(sparse_reconstruction_dir)
     else:
         reconstruction = rename_colmap_recons_and_rescale_camera(
             reconstruction,
@@ -633,57 +1034,37 @@ def demo_fn(args):
             shift_point2d_to_original_res=True,
             shared_camera=shared_camera,
             resample_colors_from_original=False,   
-            original_images_dir=image_dir,              
+            original_images_dir=image_dir,
+            remove_padding_points=True,
         )
 
-        print(f"Saving reconstruction to {output_dir}/sparse")
-        sparse_reconstruction_dir = os.path.join(output_dir, "sparse")
-        os.makedirs(sparse_reconstruction_dir, exist_ok=True)
-        reconstruction.write_text(sparse_reconstruction_dir)
+    print(f"Saving reconstruction to {output_dir}/sparse")
+    sparse_reconstruction_dir = os.path.join(output_dir, "sparse")
+    os.makedirs(sparse_reconstruction_dir, exist_ok=True)
+    reconstruction.write_text(sparse_reconstruction_dir)
 
-    if args.use_ba: # 使用BA
-        reconstruction.export_PLY(os.path.join(output_dir, "sparse/points.ply")) # 二进制ply
-        # 额外导出ASCII版本（使用trimesh重新保存）
-        # 从reconstruction中提取点云数据
-        points = []
-        colors = []
-        for point3D_id in reconstruction.points3D:
-            point3D = reconstruction.points3D[point3D_id]
-            points.append(point3D.xyz)
-            colors.append(point3D.color)
-        
-        if len(points) > 0:
-            points = np.array(points)
-            colors = np.array(colors)
-            trimesh.PointCloud(points, colors=colors).export(
-                os.path.join(output_dir, "sparse/points_ascii.ply"),
-                encoding='ascii'  # ASCII格式
-            )
-            print(f"✓ Exported ASCII PLY: {output_dir}/sparse/points_ascii.ply")
+    # 导出二进制ply
+    reconstruction.export_PLY(os.path.join(output_dir, "sparse/points.ply")) # 二进制ply
+
+    # 额外导出ASCII版本（使用trimesh重新保存）
+    # 从reconstruction中提取点云数据
+    points = []
+    colors = []
+    for point3D_id in reconstruction.points3D:
+        point3D = reconstruction.points3D[point3D_id]
+        points.append(point3D.xyz)
+        colors.append(point3D.color)
+    
+    if len(points) > 0:
+        points = np.array(points)
+        colors = np.array(colors)
+        trimesh.PointCloud(points, colors=colors).export(
+            os.path.join(output_dir, "sparse/points_ascii.ply"),
+            encoding='ascii'  # ASCII格式
+        )
+        print(f"✓ Exported ASCII PLY: {output_dir}/sparse/points_ascii.ply")
     else:
-        # # Save point cloud for fast visualization
-        # trimesh.PointCloud(points_3d, colors=points_rgb).export(
-        #     os.path.join(output_dir, "sparse/points.ply"),encoding='ascii'
-        # )
-        # Save point cloud for fast visualization
-        # 从 reconstruction 对象中提取点云（已经过 max_points3D_val 过滤）
-        points = []
-        colors = []
-        for point3D_id in reconstruction.points3D:
-            point3D = reconstruction.points3D[point3D_id]
-            points.append(point3D.xyz)
-            colors.append(point3D.color)
-        
-        if len(points) > 0:
-            points = np.array(points)
-            colors = np.array(colors)
-            trimesh.PointCloud(points, colors=colors).export(
-                os.path.join(output_dir, "sparse/points.ply"),
-                encoding='ascii'
-            )
-            print(f"Saved {len(points)} points to sparse/points.ply (after max_points3D_val={args.max_points3D_val} filtering)")
-        else:
-            print("Warning: No valid points to save after filtering")
+        print("Warning: No valid points to save after filtering")
 
     # Export GLB if requested
     if args.save_glb:
@@ -712,6 +1093,89 @@ def demo_fn(args):
     return True
 
 
+# def rename_colmap_recons_and_rescale_camera(
+#     reconstruction,
+#     image_paths,
+#     original_coords,
+#     img_size,
+#     shift_point2d_to_original_res=False,
+#     shared_camera=False,
+#     resample_colors_from_original=False,  
+#     original_images_dir=None,              
+# ):
+#     rescale_camera = True
+    
+#     # 用于收集需要删除的3D点ID
+#     points_to_remove = set()
+
+#     for pyimageid in reconstruction.images:
+#         # Reshaped the padded & resized image to the original size
+#         # Rename the images to the original names
+#         pyimage = reconstruction.images[pyimageid]
+#         pycamera = reconstruction.cameras[pyimage.camera_id]
+#         pyimage.name = image_paths[pyimageid - 1]
+
+#         if rescale_camera:
+#             # Rescale the camera parameters
+#             pred_params = copy.deepcopy(pycamera.params)
+
+#             real_image_size = original_coords[pyimageid - 1, -2:]
+#             resize_ratio = max(real_image_size) / img_size
+#             pred_params = pred_params * resize_ratio
+#             real_pp = real_image_size / 2
+#             pred_params[-2:] = real_pp  # center of the image
+
+#             pycamera.params = pred_params
+#             pycamera.width = real_image_size[0]
+#             pycamera.height = real_image_size[1]
+
+#         if shift_point2d_to_original_res:
+#             # Also shift the point2D to original resolution
+#             top_left = original_coords[pyimageid - 1, :2]
+
+#             for point2D in pyimage.points2D:
+#                 point2D.xy = (point2D.xy - top_left) * resize_ratio
+
+#         if resample_colors_from_original and original_images_dir:
+#             # 构建完整路径
+#             original_image_path = os.path.join(original_images_dir, pyimage.name)
+#             try:
+#                 original_image = Image.open(original_image_path).convert("RGB")
+#                 original_image_np = np.array(original_image)
+                
+#                 # 遍历这张图像看到的所有3D点
+#                 for point2D in pyimage.points2D:
+#                     if point2D.point3D_id != -1:  # 有效的3D点
+#                         x, y = int(point2D.xy[0]), int(point2D.xy[1])
+                        
+#                         # 检查坐标是否在原始图像范围内
+#                         if 0 <= x < original_image_np.shape[1] and 0 <= y < original_image_np.shape[0]:
+#                             # 在范围内：更新颜色
+#                             color = original_image_np[y, x]
+#                             point3D = reconstruction.points3D[point2D.point3D_id]
+#                             point3D.color = color
+#                         else:
+#                             # 超出范围：标记为需要删除
+#                             points_to_remove.add(point2D.point3D_id)
+                            
+#             except Exception as e:
+#                 print(f"Warning: Failed to resample colors from {pyimage.name}: {e}")
+
+#         if shared_camera:
+#             # If shared_camera, all images share the same camera
+#             # No need to rescale any more
+#             rescale_camera = False
+
+#     # 删除所有标记的3D点
+#     if resample_colors_from_original and points_to_remove:
+#         print(f"Removing {len(points_to_remove)} 3D points that fall outside original image boundaries")
+        
+#         for point_id in points_to_remove:
+#             if point_id in reconstruction.points3D:
+#                 del reconstruction.points3D[point_id]
+
+#     return reconstruction
+
 def rename_colmap_recons_and_rescale_camera(
     reconstruction,
     image_paths,
@@ -720,9 +1184,13 @@ def rename_colmap_recons_and_rescale_camera(
     shift_point2d_to_original_res=False,
     shared_camera=False,
     resample_colors_from_original=False,  
-    original_images_dir=None,              
+    original_images_dir=None,
+    remove_padding_points=True,  # 新增参数：是否移除padding区域的点
 ):
     rescale_camera = True
+    
+    # 用于收集需要删除的3D点ID
+    points_to_remove = set()
 
     for pyimageid in reconstruction.images:
         # Reshaped the padded & resized image to the original size
@@ -733,7 +1201,7 @@ def rename_colmap_recons_and_rescale_camera(
 
         if rescale_camera:
             # Rescale the camera parameters
-            pred_params = copy.deepcopy(pycamera.params) # 深拷贝，避免修改原始对象影响其他引用
+            pred_params = copy.deepcopy(pycamera.params)
 
             real_image_size = original_coords[pyimageid - 1, -2:]
             resize_ratio = max(real_image_size) / img_size
@@ -752,34 +1220,59 @@ def rename_colmap_recons_and_rescale_camera(
             for point2D in pyimage.points2D:
                 point2D.xy = (point2D.xy - top_left) * resize_ratio
 
-        if resample_colors_from_original and original_images_dir:
-            # 构建完整路径
-            original_image_path = os.path.join(original_images_dir, pyimage.name)
-            try:
-                original_image = Image.open(original_image_path).convert("RGB")
-                original_image_np = np.array(original_image)
-                
-                # 遍历这张图像看到的所有3D点
-                for point2D in pyimage.points2D:
-                    if point2D.point3D_id != -1:  # 有效的3D点
-                        x, y = int(point2D.xy[0]), int(point2D.xy[1])
-                        
-                        # 确保坐标在图像范围内
-                        if 0 <= x < original_image_np.shape[1] and 0 <= y < original_image_np.shape[0]:
+        # ========== 改进：统一处理padding区域的点 ==========
+        if remove_padding_points or resample_colors_from_original:
+            original_image_np = None
+            
+            # 如果需要重采样颜色，则加载原始图像
+            if resample_colors_from_original and original_images_dir:
+                original_image_path = os.path.join(original_images_dir, pyimage.name)
+                try:
+                    original_image = Image.open(original_image_path).convert("RGB")
+                    original_image_np = np.array(original_image)
+                except Exception as e:
+                    print(f"Warning: Failed to load original image {pyimage.name}: {e}")
+            
+            # 遍历这张图像看到的所有3D点
+            for point2D in pyimage.points2D:
+                if point2D.point3D_id != -1:  # 有效的3D点
+                    x, y = int(point2D.xy[0]), int(point2D.xy[1])
+                    
+                    # 获取原始图像的实际尺寸
+                    if original_image_np is not None:
+                        img_height, img_width = original_image_np.shape[:2]
+                    else:
+                        # 如果没有加载图像，使用original_coords中存储的尺寸
+                        img_width = int(original_coords[pyimageid - 1, -2])
+                        img_height = int(original_coords[pyimageid - 1, -1])
+                    
+                    # 检查坐标是否在原始图像范围内
+                    is_in_bounds = (0 <= x < img_width and 0 <= y < img_height)
+                    
+                    if is_in_bounds:
+                        # 在范围内：如果需要，更新颜色
+                        if original_image_np is not None:
                             color = original_image_np[y, x]
                             point3D = reconstruction.points3D[point2D.point3D_id]
                             point3D.color = color
-            except Exception as e:
-                print(f"Warning: Failed to resample colors from {pyimage.name}: {e}")
-            
+                    else:
+                        # 超出范围（在padding区域）：标记为需要删除
+                        points_to_remove.add(point2D.point3D_id)
 
         if shared_camera:
             # If shared_camera, all images share the same camera
             # No need to rescale any more
             rescale_camera = False
 
-    return reconstruction
+    # 删除所有标记的3D点
+    if points_to_remove:
+        print(f"Removing {len(points_to_remove)} 3D points that fall outside original image boundaries (padding regions)")
+        
+        for point_id in points_to_remove:
+            if point_id in reconstruction.points3D:
+                del reconstruction.points3D[point_id]
 
+    return reconstruction
 
 if __name__ == "__main__":
     args = parse_args()
