@@ -29,6 +29,10 @@ import numpy as np
 import rerun as rr
 import torch
 from PIL import Image
+import matplotlib
+matplotlib.use('Agg')  # 使用非交互式后端，不显示窗口
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 
 from mapanything.models import MapAnything
 from mapanything.utils.colmap import get_camera_matrix, qvec2rotmat, read_model
@@ -267,7 +271,36 @@ def log_data_to_rerun(
         ),
     )
 
-def recover_colmap_scale(outputs, original_poses, ignore_pose_inputs=False):
+def umeyama_alignment(src: np.ndarray, dst: np.ndarray, with_scale: bool = True):
+    assert src.shape == dst.shape
+    N, dim = src.shape
+
+    mu_src = src.mean(axis=0)
+    mu_dst = dst.mean(axis=0)
+    src_c = src - mu_src
+    dst_c = dst - mu_dst
+
+    Sigma = dst_c.T @ src_c / N  # (3,3)
+
+    U, D, Vt = np.linalg.svd(Sigma)
+
+    S = np.eye(dim)
+    if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+        S[-1, -1] = -1
+
+    R = U @ S @ Vt
+
+    if with_scale:
+        var_src = (src_c**2).sum() / N
+        s = (D * S.diagonal()).sum() / var_src
+    else:
+        s = 1.0
+
+    t = mu_dst - s * R @ mu_src
+
+    return s, R, t
+
+def recover_colmap_scale(outputs, original_poses, ignore_pose_inputs=False, metric_scale_value=None):
     """
     Recover COLMAP scale by comparing input and output camera poses.
     
@@ -275,39 +308,51 @@ def recover_colmap_scale(outputs, original_poses, ignore_pose_inputs=False):
         outputs: List of model output dictionaries
         original_poses: List of original COLMAP pose tensors (4x4 matrices)
         ignore_pose_inputs: Whether pose inputs were ignored during inference
+        metric_scale_value: Optional float, if provided, use this instead of computing scale_ratio
         
     Returns:
         outputs: Modified outputs with corrected scale
-        scale_ratio: The computed scale ratio (or None if not computed)
+        scale_ratio: The used scale ratio (or None if not computed)
     """
-    if len(original_poses) == 0 or ignore_pose_inputs:
+    # 如果提供了 metric_scale_value，直接使用它
+    if metric_scale_value is not None:
+        scale_ratio = metric_scale_value
+        print(f"Using provided metric_scale_value: {scale_ratio:.6f}")
+        print(f"Applying scale correction to outputs...")
+    elif len(original_poses) == 0 or ignore_pose_inputs:
         print("Skipping scale recovery (no input poses or pose inputs ignored)")
         return outputs, None
-    
-    # Compute scale factor from pose comparison
-    # Compare camera positions from input vs output
-    device = outputs[0]["camera_poses"].device
-    input_positions = torch.stack([p[:3, 3].to(device) for p in original_poses])  # (N, 3)
-    output_positions = torch.stack([outputs[i]["camera_poses"][0, :3, 3] for i in range(len(outputs))])  # (N, 3)
-    
-    # Compute pairwise distances
-    input_dists = torch.cdist(input_positions, input_positions)  # (N, N)
-    output_dists = torch.cdist(output_positions, output_positions)  # (N, N)
-    
-    # Get valid pairs (non-zero distances)
-    valid_mask = input_dists > 1e-6
-    
-    if valid_mask.sum() == 0:
-        print("Warning: Could not compute scale ratio (insufficient camera movement)")
-        return outputs, None
-    
-    # Compute scale ratio
-    scale_ratio = (input_dists[valid_mask] / (output_dists[valid_mask] + 1e-8)).median()
-    
-    print(f"Detected scale ratio COLMAP/MapAnything: {scale_ratio.item():.6f}")
-    print(f"Applying scale correction to outputs...")
+    else:
+        # Compute scale factor from pose comparison
+        # Compare camera positions from input vs output
+        device = outputs[0]["camera_poses"].device
+        input_positions = torch.stack([p[:3, 3].to(device) for p in original_poses])  # (N, 3)
+        output_positions = torch.stack([outputs[i]["camera_poses"][0, :3, 3] for i in range(len(outputs))])  # (N, 3)
+        
+        # Compute pairwise distances
+        # 计算所有两两之间的距离
+        # 计算COLMAP中每两个相机之间的距离（真实距离）
+        # 计算MapAnything中每两个相机之间的距离（模型距离）
+        input_dists = torch.cdist(input_positions, input_positions)  # (N, N)
+        output_dists = torch.cdist(output_positions, output_positions)  # (N, N)
+        
+        # Get valid pairs (non-zero distances)
+        valid_mask = input_dists > 1e-6
+        
+        if valid_mask.sum() == 0:
+            print("Warning: Could not compute scale ratio (insufficient camera movement)")
+            return outputs, None
+        
+        # Compute scale ratio
+        # 计算真实距离 ÷ 模型距离，得到缩放比例
+        # 使用中位数（median）而不是平均值，因为更稳定，不容易被异常值影响
+        scale_ratio = (input_dists[valid_mask] / (output_dists[valid_mask] + 1e-8)).median()
+        
+        print(f"Detected scale ratio COLMAP/MapAnything: {scale_ratio.item():.6f}")
+        print(f"Applying scale correction to outputs...")
     
     # Apply scale correction to all outputs
+    # 深度图乘以缩放比例、相机位置也乘以缩放比例、3D点的坐标也要缩放
     for view_idx, pred in enumerate(outputs):
         # Clone tensors to allow modification (inference tensors are read-only)
         # Scale depth
@@ -326,12 +371,317 @@ def recover_colmap_scale(outputs, original_poses, ignore_pose_inputs=False):
         # Scale 3D points in camera frame
         if "pts3d_cam" in pred:
             pred["pts3d_cam"] = pred["pts3d_cam"].clone() * scale_ratio
-        
-        # Update metric scaling factor
-        if "metric_scaling_factor" in pred:
-            pred["metric_scaling_factor"] = pred["metric_scaling_factor"].clone() * scale_ratio
-    
+
+        # Scale 3D points in world frame
+        if "pts3d" in pred:
+            pred["pts3d"] = pred["pts3d"].clone() * scale_ratio
+
     return outputs, scale_ratio
+
+def align_poses_procrustes(source_poses, target_poses, scale_fixed=False):
+    """
+    使用Umeyama算法对齐两组相机poses
+    
+    这个函数计算一个相似变换（旋转R、平移t、缩放s），使得：
+    target ≈ s * R @ source + t
+    
+    Args:
+        source_poses: List of source pose tensors (预测的poses, 4x4 cam2world)
+        target_poses: List of target pose tensors (真实的COLMAP poses, 4x4 cam2world)
+        scale_fixed: If True, only compute rotation and translation (no scaling)
+        
+    Returns:
+        aligned_poses: List of aligned pose tensors
+        R: Rotation matrix (3, 3)
+        t: Translation vector (3,)
+        s: Scale factor (scalar)
+    """
+    if len(source_poses) != len(target_poses):
+        raise ValueError(f"Number of poses must match: {len(source_poses)} vs {len(target_poses)}")
+    
+    if len(source_poses) < 3:
+        print("Warning: Need at least 3 poses for reliable alignment")
+    
+    # 提取相机位置（translation部分）
+    source_positions = []
+    target_positions = []
+    
+    for src_pose, tgt_pose in zip(source_poses, target_poses):
+        if isinstance(src_pose, torch.Tensor):
+            src_pos = src_pose[:3, 3].cpu().numpy()
+        else:
+            src_pos = src_pose[:3, 3]
+        
+        if isinstance(tgt_pose, torch.Tensor):
+            tgt_pos = tgt_pose[:3, 3].cpu().numpy()
+        else:
+            tgt_pos = tgt_pose[:3, 3]
+        
+        source_positions.append(src_pos)
+        target_positions.append(tgt_pos)
+    
+    source_positions = np.array(source_positions)  # (N, 3)
+    target_positions = np.array(target_positions)  # (N, 3)
+    
+    # 使用Umeyama算法计算相似变换
+    # 注意：umeyama_alignment计算的是 dst = s * R @ src + t
+    # 所以我们传入 src=source_positions, dst=target_positions
+    s, R, t = umeyama_alignment(source_positions, target_positions, with_scale=not scale_fixed)
+    
+    print("=" * 80)
+    print("Umeyama Pose Alignment Results")
+    print("=" * 80)
+    print(f"Number of poses aligned: {len(source_poses)}")
+    print(f"Scale factor (s): {s:.6f}")
+    print(f"Rotation matrix (R):")
+    print(R)
+    print(f"Translation vector (t): {t}")
+    
+    # 计算对齐误差
+    source_aligned_pos = (s * (R @ source_positions.T)).T + t  # (N, 3)
+    alignment_errors = np.linalg.norm(source_aligned_pos - target_positions, axis=1)
+    print(f"\nAlignment Error Statistics:")
+    print(f"  - Mean Error:   {np.mean(alignment_errors):.6f}")
+    print(f"  - Median Error: {np.median(alignment_errors):.6f}")
+    print(f"  - Max Error:    {np.max(alignment_errors):.6f}")
+    print(f"  - Min Error:    {np.min(alignment_errors):.6f}")
+    print("=" * 80)
+    
+    # 应用变换到所有poses
+    aligned_poses = []
+    for src_pose in source_poses:
+        if isinstance(src_pose, torch.Tensor):
+            pose_np = src_pose.cpu().numpy()
+            is_tensor = True
+            device = src_pose.device
+        else:
+            pose_np = src_pose.copy()
+            is_tensor = False
+        
+        # 创建新的pose矩阵
+        aligned_pose = np.eye(4)
+        
+        # 变换位置: p_new = s * R @ p_old + t
+        old_position = pose_np[:3, 3]
+        new_position = s * (R @ old_position) + t
+        aligned_pose[:3, 3] = new_position
+        
+        # 变换旋转: R_new = R @ R_old
+        old_rotation = pose_np[:3, :3]
+        new_rotation = R @ old_rotation
+        aligned_pose[:3, :3] = new_rotation
+        
+        # 转换回原始格式
+        if is_tensor:
+            aligned_pose = torch.from_numpy(aligned_pose.astype(np.float32)).to(device)
+        
+        aligned_poses.append(aligned_pose)
+    
+    return aligned_poses, R, t, s
+
+
+def align_camera_poses_to_colmap(outputs, original_poses):
+    """
+    将MapAnything预测的camera poses对齐到COLMAP的坐标系
+    
+    Args:
+        outputs: List of model output dictionaries
+        original_poses: List of original COLMAP pose tensors
+        
+    Returns:
+        aligned_poses: List of aligned pose tensors (4x4)
+        alignment_info: Dictionary containing R, t, s
+    """
+    if len(outputs) == 0 or len(original_poses) == 0:
+        print("Warning: Cannot align - missing pose data")
+        return None, None
+    
+    # 提取预测的poses
+    predicted_poses = []
+    for pred in outputs:
+        predicted_poses.append(pred["camera_poses"][0])
+    
+    # 执行Umeyama对齐
+    aligned_poses, R, t, s = align_poses_procrustes(
+        source_poses=predicted_poses,
+        target_poses=original_poses,
+        scale_fixed=False  # 允许缩放
+    )
+    
+    alignment_info = {
+        "rotation": R,
+        "translation": t,
+        "scale": s
+    }
+    
+    print("\nCamera pose alignment complete!")
+    print(f"  - Aligned {len(aligned_poses)} camera poses")
+    print(f"  - Scale: {s:.6f}, Translation: {t}")
+    
+    return aligned_poses, alignment_info
+
+def plot_camera_trajectories(original_poses, predicted_poses, scale_ratio=None, output_path=None):
+    """
+    Plot and compare camera trajectories between COLMAP (ground truth) and MapAnything predictions.
+    
+    Args:
+        original_poses: List of original COLMAP pose tensors (4x4 matrices, cam2world)
+        predicted_poses: List of predicted pose tensors from outputs (4x4 matrices, cam2world)
+        scale_ratio: Optional scale ratio applied to predictions
+        output_path: Optional path to save the plot image
+    """
+    if len(original_poses) == 0 or len(predicted_poses) == 0:
+        print("Warning: Cannot plot trajectories - missing pose data")
+        return
+    
+    # Extract camera positions (translation vectors)
+    original_positions = []
+    for pose in original_poses:
+        if isinstance(pose, torch.Tensor):
+            pos = pose[:3, 3].cpu().numpy()
+        else:
+            pos = pose[:3, 3]
+        original_positions.append(pos)
+    original_positions = np.array(original_positions)  # (N, 3)
+    
+    predicted_positions = []
+    for pose in predicted_poses:
+        if isinstance(pose, torch.Tensor):
+            pos = pose[:3, 3].cpu().numpy()
+        else:
+            pos = pose[:3, 3]
+        predicted_positions.append(pos)
+    predicted_positions = np.array(predicted_positions)  # (N, 3)
+    
+    # Calculate statistics
+    position_errors = np.linalg.norm(original_positions - predicted_positions, axis=1)
+    mean_error = np.mean(position_errors)
+    max_error = np.max(position_errors)
+    median_error = np.median(position_errors)
+    
+    print("=" * 80)
+    print("Camera Trajectory Comparison Statistics")
+    print("=" * 80)
+    print(f"Number of cameras: {len(original_poses)}")
+    if scale_ratio is not None:
+        print(f"Applied scale ratio: {scale_ratio:.6f}")
+    print(f"Position Error Statistics:")
+    print(f"  - Mean Error:   {mean_error:.4f}")
+    print(f"  - Median Error: {median_error:.4f}")
+    print(f"  - Max Error:    {max_error:.4f}")
+    print("=" * 80)
+    
+    # Create figure with subplots
+    fig = plt.figure(figsize=(20, 10))
+    
+    # 3D trajectory plot
+    ax1 = fig.add_subplot(2, 3, 1, projection='3d')
+    ax1.plot(original_positions[:, 0], original_positions[:, 1], original_positions[:, 2], 
+             'b-o', label='COLMAP (Ground Truth)', linewidth=2, markersize=6)
+    ax1.plot(predicted_positions[:, 0], predicted_positions[:, 1], predicted_positions[:, 2], 
+             'r--s', label='MapAnything (Predicted)', linewidth=2, markersize=4, alpha=0.7)
+    
+    # Mark start and end points
+    ax1.scatter(original_positions[0, 0], original_positions[0, 1], original_positions[0, 2], 
+                c='green', s=200, marker='*', label='Start', edgecolors='black', linewidths=2)
+    ax1.scatter(original_positions[-1, 0], original_positions[-1, 1], original_positions[-1, 2], 
+                c='orange', s=200, marker='X', label='End', edgecolors='black', linewidths=2)
+    
+    ax1.set_xlabel('X')
+    ax1.set_ylabel('Y')
+    ax1.set_zlabel('Z')
+    ax1.set_title('3D Camera Trajectories Comparison')
+    ax1.legend()
+    ax1.grid(True)
+    
+    # Top view (X-Y plane)
+    ax2 = fig.add_subplot(2, 3, 2)
+    ax2.plot(original_positions[:, 0], original_positions[:, 1], 'b-o', 
+             label='COLMAP', linewidth=2, markersize=6)
+    ax2.plot(predicted_positions[:, 0], predicted_positions[:, 1], 'r--s', 
+             label='MapAnything', linewidth=2, markersize=4, alpha=0.7)
+    ax2.scatter(original_positions[0, 0], original_positions[0, 1], 
+                c='green', s=200, marker='*', label='Start', edgecolors='black', linewidths=2)
+    ax2.set_xlabel('X')
+    ax2.set_ylabel('Y')
+    ax2.set_title('Top View (X-Y Plane)')
+    ax2.legend()
+    ax2.grid(True)
+    ax2.axis('equal')
+    
+    # Side view (X-Z plane)
+    ax3 = fig.add_subplot(2, 3, 3)
+    ax3.plot(original_positions[:, 0], original_positions[:, 2], 'b-o', 
+             label='COLMAP', linewidth=2, markersize=6)
+    ax3.plot(predicted_positions[:, 0], predicted_positions[:, 2], 'r--s', 
+             label='MapAnything', linewidth=2, markersize=4, alpha=0.7)
+    ax3.scatter(original_positions[0, 0], original_positions[0, 2], 
+                c='green', s=200, marker='*', label='Start', edgecolors='black', linewidths=2)
+    ax3.set_xlabel('X')
+    ax3.set_ylabel('Z')
+    ax3.set_title('Side View (X-Z Plane)')
+    ax3.legend()
+    ax3.grid(True)
+    ax3.axis('equal')
+    
+    # Front view (Y-Z plane)
+    ax4 = fig.add_subplot(2, 3, 4)
+    ax4.plot(original_positions[:, 1], original_positions[:, 2], 'b-o', 
+             label='COLMAP', linewidth=2, markersize=6)
+    ax4.plot(predicted_positions[:, 1], predicted_positions[:, 2], 'r--s', 
+             label='MapAnything', linewidth=2, markersize=4, alpha=0.7)
+    ax4.scatter(original_positions[0, 1], original_positions[0, 2], 
+                c='green', s=200, marker='*', label='Start', edgecolors='black', linewidths=2)
+    ax4.set_xlabel('Y')
+    ax4.set_ylabel('Z')
+    ax4.set_title('Front View (Y-Z Plane)')
+    ax4.legend()
+    ax4.grid(True)
+    ax4.axis('equal')
+    
+    # Position error over camera index
+    ax5 = fig.add_subplot(2, 3, 5)
+    camera_indices = np.arange(len(position_errors))
+    ax5.plot(camera_indices, position_errors, 'g-o', linewidth=2, markersize=6)
+    ax5.axhline(y=mean_error, color='r', linestyle='--', label=f'Mean: {mean_error:.4f}')
+    ax5.axhline(y=median_error, color='b', linestyle='--', label=f'Median: {median_error:.4f}')
+    ax5.set_xlabel('Camera Index')
+    ax5.set_ylabel('Position Error')
+    ax5.set_title('Position Error per Camera')
+    ax5.legend()
+    ax5.grid(True)
+    
+    # Error histogram
+    ax6 = fig.add_subplot(2, 3, 6)
+    ax6.hist(position_errors, bins=20, color='skyblue', edgecolor='black', alpha=0.7)
+    ax6.axvline(x=mean_error, color='r', linestyle='--', linewidth=2, label=f'Mean: {mean_error:.4f}')
+    ax6.axvline(x=median_error, color='b', linestyle='--', linewidth=2, label=f'Median: {median_error:.4f}')
+    ax6.set_xlabel('Position Error')
+    ax6.set_ylabel('Frequency')
+    ax6.set_title('Position Error Distribution')
+    ax6.legend()
+    ax6.grid(True, alpha=0.3)
+    
+    plt.suptitle(f'Camera Trajectory Comparison\n'
+                 f'Scale Ratio: {scale_ratio:.6f} | Mean Error: {mean_error:.4f} | Max Error: {max_error:.4f}',
+                 fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    
+    # Save plot (no display)
+    if output_path:
+        # 确保输出目录存在
+        output_dir = os.path.dirname(output_path)
+        if output_dir:  # 如果有目录路径（不是当前目录）
+            os.makedirs(output_dir, exist_ok=True)
+        plt.savefig(output_path, dpi=300, bbox_inches='tight')
+        print(f"Trajectory comparison plot saved to: {output_path}")
+    else:
+        # 如果没有指定路径，生成默认文件名
+        default_path = "trajectory_comparison.png"
+        plt.savefig(default_path, dpi=300, bbox_inches='tight')
+        print(f"Trajectory comparison plot saved to: {default_path}")
+
+    plt.close()
 
 def get_parser():
     """Create argument parser"""
@@ -416,6 +766,30 @@ def get_parser():
         default=False,
         help="Ignore COLMAP pose inputs (use only images and calibration)",
     )
+    parser.add_argument(
+        "--scale_mode",
+        type=str,
+        default="metric",
+        choices=["metric", "compute", "none"],
+        help=(
+            "Scale recovery mode: "
+            "'metric' - use metric_scaling_factor from model output (default), "
+            "'compute' - compute scale_ratio from camera poses, "
+            "'none' - no scaling (scale=1.0)"
+        ),
+    )
+    parser.add_argument(
+        "--plot_trajectories",
+        action="store_true",
+        default=False,
+        help="Plot and compare camera trajectories between COLMAP and MapAnything",
+    )
+    parser.add_argument(
+        "--trajectory_plot_path",
+        type=str,
+        default=None,
+        help="Path to save trajectory comparison plot (if not specified, will save to output_directory)",
+    )
 
     return parser
 
@@ -493,21 +867,90 @@ def main():
         if "camera_poses" in view:
             original_poses.append(view["camera_poses"].clone())
     
-    # Recover COLMAP scale
+    # Recover COLMAP scale, scale_ratio has used in this function process
+    metric_scale_value = None
+    if args.scale_mode == "metric":
+        # 模式1: 使用 metric_scaling_factor（如果存在）
+        if len(outputs) > 0 and "metric_scaling_factor" in outputs[0]:
+            metric_scale_tensor = outputs[0]["metric_scaling_factor"]
+            if metric_scale_tensor is not None:
+                # 从 tensor([[7.8367]], device='cuda:0') 提取出 7.8367
+                metric_scale_value = metric_scale_tensor.item()
+                print(f"[Scale Mode: metric] Extracted metric_scaling_factor: {metric_scale_value}")
+            else:
+                print("[Scale Mode: metric] metric_scaling_factor is None, will compute scale_ratio instead")
+        else:
+            print("[Scale Mode: metric] No metric_scaling_factor found in outputs, will compute scale_ratio instead")
+    elif args.scale_mode == "compute":
+        # 模式2: 强制计算 scale_ratio（不使用 metric_scaling_factor）
+        print("[Scale Mode: compute] Will compute scale_ratio from camera poses")
+        metric_scale_value = None
+    elif args.scale_mode == "none":
+        # 模式3: 不做任何缩放
+        print("[Scale Mode: none] No scaling will be applied (scale=1.0)")
+        metric_scale_value = 1.0
+        
     outputs, scale_ratio = recover_colmap_scale(
         outputs, 
         original_poses, 
-        ignore_pose_inputs=args.ignore_pose_inputs
+        ignore_pose_inputs=args.ignore_pose_inputs,
+        metric_scale_value=metric_scale_value
     )
+
+    if args.plot_trajectories:
+        # 使用Umeyama算法进行完整的位姿配准（包括旋转和平移）
+        if len(original_poses) > 0 and not args.ignore_pose_inputs:
+            print("\n" + "=" * 80)
+            print("Aligning predicted poses to COLMAP coordinate system using Umeyama algorithm")
+            print("=" * 80)
+            aligned_poses, alignment_info = align_camera_poses_to_colmap(outputs, original_poses)
+            print()
+        else:
+            print("\nSkipping pose alignment (no COLMAP poses available)")
+            alignment_info = None
+
+        # Plot camera trajectories comparison if requested
+        print("\n" + "=" * 80)
+        print("Generating Camera Trajectory Comparison Plot")
+        print("=" * 80)
+        
+        # Extract predicted poses from outputs (after scale correction)
+        if aligned_poses is not None:
+            predicted_poses_to_plot = aligned_poses
+            print("Using aligned poses for trajectory comparison")
+        else:
+            # 提取原始预测poses
+            predicted_poses_to_plot = []
+            for pred in outputs:
+                pred_pose = pred["camera_poses"][0]  # (4, 4)
+                predicted_poses_to_plot.append(pred_pose)
+            print("Using original predicted poses for trajectory comparison")
+
+        # Determine output path for plot
+        if args.trajectory_plot_path:
+            plot_output_path = args.trajectory_plot_path
+        else:
+            os.makedirs(args.output_directory, exist_ok=True)
+            plot_output_path = os.path.join(
+                args.output_directory, 
+                f"{os.path.basename(args.output_directory)}_trajectory_comparison.png"
+            )
+        
+        # Plot trajectories
+        plot_camera_trajectories(
+            original_poses=original_poses,
+            predicted_poses=predicted_poses_to_plot,
+            scale_ratio=scale_ratio * alignment_info["scale"],
+            output_path=plot_output_path
+        )
+        print()
 
     # Loop through the outputs
     for view_idx, pred in enumerate(outputs):
-        # Extract data from predictions
-        depthmap_torch = pred["depth_z"][0].squeeze(-1)  # (H, W)
-        intrinsics_torch = pred["intrinsics"][0]  # (3, 3)
-        camera_pose_torch = pred["camera_poses"][0]  # (4, 4)
-
-        # Compute new pts3d using depth, intrinsics, and camera pose
+        # 如果没有pts3d，则需要重新计算（通常不会发生）
+        depthmap_torch = pred["depth_z"][0].squeeze(-1)
+        intrinsics_torch = pred["intrinsics"][0]
+        camera_pose_torch = pred["camera_poses"][0]
         pts3d_computed, valid_mask = depthmap_to_world_frame(
             depthmap_torch, intrinsics_torch, camera_pose_torch
         )
@@ -619,7 +1062,8 @@ def main():
         print(f"Saving PLY file to: {ply_output_path}")
 
         # Save PLY file
-        scene_3d_ply.export(ply_output_path, encoding='ascii')
+        # scene_3d_ply.export(ply_output_path, encoding='ascii')
+        scene_3d_ply.export(ply_output_path, encoding='binary')
         print(f"Successfully saved PLY file: {ply_output_path}")
 
     if not args.save_glb and not args.save_ply:

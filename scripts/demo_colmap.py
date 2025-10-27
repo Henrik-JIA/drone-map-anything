@@ -137,6 +137,16 @@ def parse_args():
              "Use larger values (e.g., 10000) for large-scale scenes, smaller values (e.g., 500) for indoor scenes. "
              "Default: 3000.0",
     )
+    parser.add_argument(
+        "--min_inlier_per_frame",
+        type=int,
+        default=32,
+        help="Minimum number of valid inlier points required per frame for BA. "
+            "Frames with fewer inliers will cause BA to skip. "
+            "Lower values (e.g., 16) allow more frames but may reduce accuracy. "
+            "Higher values (e.g., 64) ensure better quality but may reject more frames. "
+            "Default: 32",
+    )
     return parser.parse_args()
 
 
@@ -870,7 +880,7 @@ def demo_fn(args):
             shared_camera=shared_camera, # 如果 shared_camera=False，每帧创建新的相机；如果 shared_camera=True，只在第一帧创建，后续帧复用。
             camera_type=args.camera_type,
             points_rgb=points_rgb,
-            min_inlier_per_frame=32,
+            min_inlier_per_frame=args.min_inlier_per_frame,
         )
 
         if reconstruction is None:
