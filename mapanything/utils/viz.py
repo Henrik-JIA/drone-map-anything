@@ -307,13 +307,13 @@ def predictions_to_ply(
     vertices_3d = vertices_3d[final_masks].copy()
     colors_rgb = colors_rgb[final_masks].copy()
 
-    # Apply 180° rotation around X-axis to fix orientation (upside-down issue)
-    rotation_matrix = np.array([
-        [1, 0, 0],
-        [0, -1, 0],
-        [0, 0, -1]
-    ], dtype=np.float32)
-    vertices_3d = vertices_3d @ rotation_matrix.T
+    # # Apply 180° rotation around X-axis to fix orientation (upside-down issue)
+    # rotation_matrix = np.array([
+    #     [1, 0, 0],
+    #     [0, -1, 0],
+    #     [0, 0, -1]
+    # ], dtype=np.float32)
+    # vertices_3d = vertices_3d @ rotation_matrix.T
 
     if as_mesh:
         # For mesh mode with multiple frames, we need to combine all frames
